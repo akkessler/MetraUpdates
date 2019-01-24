@@ -141,3 +141,8 @@ def lambda_handler(event, context):
     return {
         'statusCode': 200,
     }
+
+# This allows for easier local testing
+if __name__ == '__main__':
+    print('Invoking local Lambda handler...')
+    lambda_handler(None, None)
