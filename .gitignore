@@ -1,2 +1,4 @@
+.vscode
+
 credentials.json
-stop_times.json
+stop_times*.json
