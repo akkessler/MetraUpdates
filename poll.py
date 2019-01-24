@@ -1,18 +1,20 @@
-import requests
+from botocore.vendored import requests
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 import os.path
 import time
-from datetime import datetime, timedelta
 
 with open('credentials.json', 'r') as f:
     creds = json.load(f)
 
 METRA_AUTH = (creds['metraClient'], creds['metraSecret'])
-HOST = 'https://gtfsapi.metrarail.com/gtfs'
+METRA_URL = 'https://gtfsapi.metrarail.com/gtfs'
 SLACK_URL = 'https://hooks.slack.com/services/' + creds['slackHook']
-HEADERS = {'Content-Type': 'application/json'}
+CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/calendars/' + creds['googleCalendar']
+GOOGLE_KEY = creds['googleKey']
 RED = '#D00000'
+YELLOW = '#D0D000'
 GREEN = '#00D000'
 MAGENTA = '#FF00FF'
 TIME_FORMAT = '%H:%M'
@@ -21,7 +23,7 @@ delayed_template = '{adjust_time} arrival for {normal_time} {direction} train. (
 normal_template = '{normal_time} {direction} train is arriving on time.'
 
 def get(endpoint):
-    resp = requests.get(HOST + endpoint, auth=METRA_AUTH)
+    resp = requests.get(METRA_URL + endpoint, auth=METRA_AUTH)
     return resp.json()
 
 def pretty(obj):
@@ -46,8 +48,7 @@ def post_slack(title='', text='', color=MAGENTA):
             }
         ]
     }
-    resp = requests.post(SLACK_URL, data=json.dumps(slack_payload), headers=HEADERS)
-    print(resp)
+    requests.post(SLACK_URL, data=json.dumps(slack_payload), headers={'Content-Type': 'application/json'})
 
 def load_input(path):
     with open(path,'r') as f:
@@ -69,6 +70,7 @@ def load_stop_times(local=True):
             json.dump(stop_times, f)
 
 def find_trip_id(stop_id, stop_time):
+    load_stop_times()
     arrival_time = stop_time + ':00' # add seconds
     for x in stop_times:
         if x['stop_id'] == stop_id and x['arrival_time'] == arrival_time: 
@@ -84,56 +86,58 @@ def get_delays(trip_id, stop_id):
         if x['id'] == trip_id:
             for y in x['trip_update']['stop_time_update']:
                 if  y['stop_id'] == stop_id:
-                    return y['arrival']['delay']
+                    return y['arrival']['delay'] # arrival.time.low
     return 0
 
-if len(sys.argv) != 2:
-    print('Usage: python {0} input.json'.format(sys.argv[0]))
-    sys.exit(1) 
-path = sys.argv[1]
-if not os.path.isfile(path):
-    print(sys.argv[1] + ' is not a valid file.')
-    sys.exit(2) 
-
-# TODO Parameterize sleep values
-sleep_duration = 30 # how long to sleep between polls
-sleep_counter = 60 # how many times to poll
-
-inputs = load_input(path)
-load_stop_times()
-while True:
-    for i in inputs:
-        stop_id = i['stop_id']
-        stop_time = i['stop_time']
-        trip_id = i['trip_id']
-        direction = i['direction']
-        normal_arrival = datetime.strptime(stop_time, TIME_FORMAT)
+def lambda_handler(event, context):
+    load_stop_times(local=True)
+    now = datetime.utcnow()
+    last_hour = now - timedelta(hours=3)
+    next_hour = now + timedelta(hours=3)
+    # next_day = datetime(now.year, now.month, now.day) + timedelta(days=1) # copy without time components
+    params = {
+        'key': GOOGLE_KEY,
+        'timeMin': last_hour.isoformat('T') + 'Z',
+        'timeMax': next_hour.isoformat('T') + 'Z',
+        'singleEvents': True # expands recurring events into their own objects.
+    }
+    r = requests.get(CALENDAR_URL + '/events', params=params)
+    for i in r.json()['items']:
+        data = i['description'].split('\n')
+        trip_id = data[0]
+        stop_id = data[1]
+        for x in stop_times:
+            if x['trip_id'] == trip_id and x['stop_id'] == stop_id:
+                stop_time = x['arrival_time'][:-3]
+        previous_arrival = datetime.strptime(i['start']['dateTime'] , '%Y-%m-%dT%H:%M:%S%z').replace(tzinfo=None)
+        normal_arrival = datetime.strptime(stop_time, TIME_FORMAT).replace(year=previous_arrival.year, month=previous_arrival.month, day=previous_arrival.day)
         normal_time = stop_time
+        direction = 'inbound' if normal_arrival.hour < 12 else 'outbound' # TODO Assumes all trains before noon are inbound, which isn't true.
         delay = get_delays(trip_id, stop_id)
         # delay = 260 # can hardcode delays here for testing
-        if delay != 0:
-            delay_time = timedelta(seconds=abs(delay))
-            adjust_arrival = normal_arrival + (delay_time * (-1 if delay < 0 else 1))
-            adjust_time = adjust_arrival.strftime(TIME_FORMAT)
-            text = delayed_template.format(
-                normal_time=normal_time, 
-                direction=direction, 
-                adjust_time=adjust_time, 
-                delay=('+' if delay > 0 else '-') + str(delay_time)
-            )
-            color = RED
-        else:
-            text = normal_template.format(
-                normal_time=normal_time,
-                direction=direction,
-            )
-            color = GREEN
-        post_slack(title=stop_id,text=text,color=color)
-
-    if sleep_counter > 0:
-        sleep_counter -= 1
-        time.sleep(sleep_duration)
-        trip_updates = None
-    else:
-        break
+        delay_time = timedelta(seconds=abs(delay))
+        adjust_arrival = normal_arrival + (delay_time * (-1 if delay < 0 else 1))
+        adjust_time = adjust_arrival.strftime(TIME_FORMAT)
+        difference = (adjust_arrival - previous_arrival).total_seconds()
+        if difference != 0:
+            # TODO Update Calendar Event with New Arrival Time
+            color = YELLOW if difference < 0 else RED
+            print(difference, delay)
+            if delay == 0:
+                color = GREEN
+                text = normal_template.format(
+                    normal_time=normal_time,
+                    direction=direction,
+                )
+            else:
+                text = delayed_template.format(
+                    normal_time=normal_time, 
+                    direction=direction, 
+                    adjust_time=adjust_time, 
+                    delay=('+' if delay > 0 else '-') + str(delay_time)
+                )
+            post_slack(title=stop_id,text=text,color=color)
         
+    return {
+        'statusCode': 200,
+    }
